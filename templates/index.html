@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Torch Model Dashboard – Dark</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font-family:Arial,Helvetica,sans-serif;overflow:hidden}
+  #three-canvas{position:fixed;inset:0;z-index:1}
+  #ui{position:absolute;inset:0;z-index:2;pointer-events:none}
+  #sidebar{pointer-events:auto;background:rgba(0,0,0,0.8);width:340px;height:100%;padding:12px;overflow-y:auto}
+  details{margin:8px 0;background:#222;padding:6px;border-radius:4px}
+  summary{cursor:pointer}
+  canvas.chart{width:100%!important;height:180px!important}
+  #heatmap{max-width:100%;height:auto;background:#000;display:block}
+  .spinner{display:none;width:16px;height:16px;border:2px solid #444;border-top-color:#fff;border-radius:50%;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+
+<body>
+<canvas id="three-canvas"></canvas>
+
+<div id="ui">
+  <div id="sidebar">
+    <input type="file" id="file" accept=".pth,.pt">
+    <button id="upload">Upload <span class="spinner" id="spin"></span></button>
+    <select id="layer"><option value="">– select layer –</option></select>
+    <details open><summary>Overall</summary><div id="overall"></div></details>
+    <details open><summary>Indicators</summary><div id="indicators"></div></details>
+    <details open><summary>Stats</summary><div id="stats"></div></details>
+    <details><summary>1-D Line</summary><canvas id="line" class="chart"></canvas></details>
+    <details><summary>2-D Heatmap</summary><img id="heatmap"></details>
+    <details><summary>Histogram</summary><canvas id="hist" class="chart"></canvas></details>
+  </div>
+
+    <div id="text-overlay">
+        
+        
+    </div>
+</div>
+
+
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+// ---------- Three.js ----------
+const canvas = document.getElementById('three-canvas');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, .1, 100);
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x111111);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+camera.position.set(1.5,1.5,1.5);
+let points = null;
+
+function render(){ requestAnimationFrame(render); controls.update(); renderer.render(scene,camera); }
+render();
+
+addEventListener('resize',()=>{ 
+  camera.aspect = innerWidth/innerHeight; 
+  camera.updateProjectionMatrix(); 
+  renderer.setSize(innerWidth, innerHeight); 
+});
+
+/* ---------- UI ---------- */
+let model = null;
+let lineChart = null, histChart = null;
+
+document.getElementById('upload').addEventListener('click', async () => {
+  const file = document.getElementById('file').files[0];
+  if (!file) return alert('Select a .pth/.pt file first');
+
+  const btn = document.getElementById('upload');
+  const spin = document.getElementById('spin');
+  btn.disabled = true; spin.style.display = 'inline-block';
+
+  const fd = new FormData(); fd.append('model', file);
+  try {
+    const r = await fetch('/upload', {method:'POST', body:fd});
+    const json = await r.json();
+    if (json.error) throw json.error;
+    model = json;
+    populateOverall();
+    populateSelect();
+  } catch(e){ alert('Error: '+e); }
+  finally { btn.disabled = false; spin.style.display = 'none'; }
+});
+
+function populateOverall(){
+  const o = model.overall;
+  document.getElementById('overall').innerHTML = `<br>
+    Layers: ${o.num_layers}<br>
+    Parameters: ${o.num_params.toLocaleString()}`;
+  document.getElementById('indicators').innerHTML = `<br>
+    Over-fit: ${model.indicators.possible_overfit?'Yes':'No'}<br>
+    High zeros: ${model.indicators.high_zeros?'Yes':'No'}<br>
+    Divergence: ${model.indicators.over_divergence?'Yes':'No'}<br>
+    <ul>${model.indicators.notes.map(n=>`<li>${n}</li>`).join('')}</ul>`;
+}
+
+function populateSelect(){
+  const sel = document.getElementById('layer');
+  sel.innerHTML = '<option value="">– select layer –</option>';
+  Object.keys(model.data).forEach(k=>{
+    const opt = document.createElement('option'); opt.value = k; opt.textContent = k;
+    sel.appendChild(opt);
+  });
+  sel.onchange = showLayer;
+}
+
+function showLayer(){
+  const key = this.value; if(!key) return;
+  const d = model.data[key];
+
+  // Stats
+  document.getElementById('stats').innerHTML = `
+    Shape: ${d.shape.join('×')}<br>
+    Mean: ${d.mean.toFixed(4)} | Std: ${d.std.toFixed(4)}<br>
+    Min: ${d.min.toFixed(4)} | Max: ${d.max.toFixed(4)}<br>
+    Zeros: ${d.zero_percentage.toFixed(2)}%`;
+
+  // 2-D Heatmap
+  const img = document.getElementById('heatmap');
+  img.src = 'data:image/png;base64,'+d['2d_image'];
+  img.style.maxWidth = '100%';
+  img.style.height = 'auto';
+
+  // Histogram
+  const hctx = document.getElementById('hist');
+  if(histChart) histChart.destroy();
+  histChart = new Chart(hctx, {
+    type:'bar', 
+    data:{labels:d.bins.map(b=>b.toFixed(3)), datasets:[{label:'Histogram',data:d.hist,backgroundColor:'#69f'}]},
+    options:{plugins:{legend:{labels:{color:'#eee'}}}, scales:{x:{ticks:{color:'#eee'}}, y:{ticks:{color:'#eee'}}}}
+  });
+
+  // 1-D line
+  const lctx = document.getElementById('line');
+  if(lineChart) lineChart.destroy();
+  lineChart = new Chart(lctx, {
+    type:'line', 
+    data:{labels:d.flat_1d.map((_,i)=>i), datasets:[{label:'Values',data:d.flat_1d,borderColor:'#fff',tension:0.1}]},
+    options:{plugins:{legend:{labels:{color:'#eee'}}}, scales:{x:{ticks:{color:'#eee'}}, y:{ticks:{color:'#eee'}}}}
+  });
+
+  // 3-D point cloud with size
+  if(points) scene.remove(points);
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(d['3d_positions'],3));
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(d['3d_colors'],3));
+  geom.setAttribute('size', new THREE.Float32BufferAttribute(d['3d_sizes'],1));
+
+    const material = new THREE.ShaderMaterial({
+        vertexShader: `
+        attribute float size;
+        varying vec3 vColor;
+        void main() {
+            vColor = color;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = size * 3.0 / -mvPosition.z;
+            gl_Position = projectionMatrix * mvPosition;
+        }
+        `,
+        fragmentShader: `
+        varying vec3 vColor;
+        void main() {
+            if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;
+            gl_FragColor = vec4(vColor, 1.0);
+        }
+        `,
+        vertexColors: true,
+        transparent: true
+    });
+
+  points = new THREE.Points(geom, material);
+  scene.add(points);
+
+  const box = new THREE.Box3().setFromObject(points);
+  const center = box.getCenter(new THREE.Vector3());
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(1.5,1.5,1.5));
+}
+</script>
+</body>
+</html>
